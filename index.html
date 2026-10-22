@@ -642,6 +642,23 @@ body {
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+.empty{grid-column:1/-1;text-align:center;color:var(--ink-muted);padding:60px 0;font-size:.95rem}
+.sentinel{height:2px}
+.lb-img{transition:transform .25s ease,opacity .2s ease}
+.lb-img.loading{opacity:.75}
+@media (max-width:820px){
+  .card:not(.loaded){min-height:170px}
+}
+
+/* ============ PINTEREST MASONRY ============ */
+.gallery-container{display:flex!important;gap:16px!important;align-items:flex-start;columns:auto!important}
+.mcol{flex:1 1 0;min-width:0;display:flex;flex-direction:column;gap:16px}
+.card{height:auto!important;aspect-ratio:auto!important;margin-bottom:0!important}
+.card img{position:static!important;width:100%!important;height:auto!important;display:block!important;color:transparent}
+.card:not(.loaded){aspect-ratio:3/4!important;min-height:0!important}
+.empty{width:100%}
+@media (max-width:820px){.gallery-container{gap:10px!important}.mcol{gap:10px}}
 </style>
 </head>
 <body>
@@ -677,14 +694,12 @@ body {
       </p>
     </section>
 
-    <!-- Status Bar (Photograph Count) -->
     <div class="gallery-status-bar">
       <span class="photo-count-label" id="photoCountLabel">Loading photographs…</span>
     </div>
 
-    <!-- Gallery (Desktop 3-Col Bento / Mobile 2-Col Masonry) -->
     <main id="gallery" class="gallery-container" aria-live="polite"></main>
-
+    <div class="sentinel" id="sentinel"></div>
   </div>
 
   <!-- Full-Screen Lightbox Modal -->
@@ -727,227 +742,216 @@ body {
       </button>
     </div>
   </div>
-
 <script>
 (function () {
   "use strict";
 
-  // Build accurate list of 859 images with exact casing (1-144 JPG, 145-859 jpg)
-  const TOTAL_PHOTOS = 283;
-  const photoList = [];
-  for (let i = 1; i <= TOTAL_PHOTOS; i++) {
-    const ext = (i <= 144) ? "JPG" : "jpg";
-    const filename = `img (${i}).${ext}`;
-    photoList.push({
-      id: i,
-      filename: filename,
-      src: './' + encodeURI(filename),
-      status: 'pending'
-    });
+  /* =====================================================
+     1) CONFIG — edit this part only
+     ===================================================== */
+  const TOTAL_PHOTOS = 283;                       // <-- your real image count
+  const FOLDER = "./";   // where the ORIGINAL images are. Same repo: "./" or "./images/"  |  external (e.g. Cloudflare R2): "https://pub-xxxx.r2.dev/"
+  const FILE_EXT = n => (n <= 144 ? "JPG" : "jpg"); // your original casing rule
+  const FILENAME = n => `img (${n}).${FILE_EXT(n)}`;
+
+  // Preview (thumbnail) source:
+  //  "auto"   -> on GitHub Pages uses a free resize CDN (wsrv.nl), locally uses originals
+  //  "cdn"    -> always use the CDN      "folder" -> use ./thumbs/<same filename>
+  //  "none"   -> originals everywhere
+  const THUMB_MODE = "auto";
+  const THUMB_FOLDER = "./thumbs/";
+  const THUMB_W = 520, THUMB_Q = 60;               // preview width & quality
+
+  /* =====================================================
+     2) DATA
+     ===================================================== */
+  function buildMeta(i) {
+    const filename = FILENAME(i);
+    return { id: i, filename, src: FOLDER + encodeURI(filename) };
+  }
+  const photos = [];
+  for (let i = 1; i <= TOTAL_PHOTOS; i++) photos.push(buildMeta(i));
+
+  const useCdn = THUMB_MODE === "cdn" ||
+    (THUMB_MODE === "auto" && location.protocol === "https:" && !/^(localhost|127\.)/.test(location.hostname));
+  function thumbUrl(p) {
+    if (THUMB_MODE === "none") return p.src;
+    if (THUMB_MODE === "folder") return THUMB_FOLDER + encodeURI(p.filename);
+    if (!useCdn) return p.src;
+    const abs = new URL(p.src, location.href).href.replace(/\(/g, "%28").replace(/\)/g, "%29");
+    return `https://wsrv.nl/?url=${encodeURIComponent(abs)}&w=${THUMB_W}&q=${THUMB_Q}&we&output=webp`;
   }
 
-  const galleryEl = document.getElementById("gallery");
-  const countLabel = document.getElementById("photoCountLabel");
+  /* =====================================================
+     3) STATE
+     ===================================================== */
+  const view = photos;   // every photo is shown
 
-  // Lightbox elements
-  const lightbox = document.getElementById("lightbox");
-  const lbImg = document.getElementById("lbImg");
-  const lbStage = document.getElementById("lbStage");
-  const lbCounter = document.getElementById("lbCounter");
-  const lbDownload = document.getElementById("lbDownload");
-  const lbClose = document.getElementById("lbClose");
-  const lbPrev = document.getElementById("lbPrev");
-  const lbNext = document.getElementById("lbNext");
-  const lbMobilePrev = document.getElementById("lbMobilePrev");
-  const lbMobileNext = document.getElementById("lbMobileNext");
+  const $ = id => document.getElementById(id);
+  const galleryEl = $("gallery"), countLabel = $("photoCountLabel"), sentinel = $("sentinel");
 
-  // Theme Toggle
-  const desktopThemeBtn = document.getElementById("desktopThemeBtn");
+  function render() {
+    cards = []; rendered = 0; buildCols();
+    countLabel.textContent = `${view.length} photographs`;
+    renderBatch();
+  }
 
-  let currentIdx = 0;
-  let renderedCount = 0;
-  const BATCH_SIZE = 40;
+  /* =====================================================
+     4) GALLERY
+     ===================================================== */
+  let cards = [], colEls = [], colCount = 0;
+  const calcCols = () => { const w = galleryEl.clientWidth; return w < 480 ? 2 : w < 760 ? 3 : w < 1000 ? 4 : 5; };
+  function placeCard(card) {           // put card in the currently shortest column
+    let best = colEls[0];
+    for (const c of colEls) if (c.offsetHeight < best.offsetHeight) best = c;
+    best.appendChild(card);
+  }
+  function buildCols() {
+    colCount = calcCols();
+    galleryEl.innerHTML = "";
+    colEls = [];
+    for (let i = 0; i < colCount; i++) { const c = document.createElement("div"); c.className = "mcol"; galleryEl.appendChild(c); colEls.push(c); }
+    cards.forEach(placeCard);
+  }
+  let rzT;
+  window.addEventListener("resize", () => {
+    clearTimeout(rzT);
+    rzT = setTimeout(() => { if (view.length && calcCols() !== colCount) buildCols(); }, 150);
+  });
 
-  // Create clean card
-  function createCard(photo, index) {
+  const BATCH = 40;
+  let rendered = 0;
+  
+  // wrong .JPG/.jpg casing on the server? flip it once
+  function swapCase(p) {
+    const e = p.filename.match(/\.(\w+)$/)[1];
+    const ne = e === e.toUpperCase() ? e.toLowerCase() : e.toUpperCase();
+    p.filename = p.filename.slice(0, -e.length) + ne;
+    p.src = FOLDER + encodeURI(p.filename);
+    p.swapped = true;
+  }
+  // Download the untouched original (also works when images live on another site)
+  async function saveOriginal(e, p) {
+    if (new URL(p.src, location.href).origin === location.origin) return; // same site: normal download
+    e.preventDefault();
+    try {
+      const r = await fetch(p.src); if (!r.ok) throw 0;
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(await r.blob());
+      a.download = p.filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    } catch (err) { window.open(p.src, "_blank"); }
+  }
+
+  function createCard(p, index) {
     const card = document.createElement("figure");
     card.className = "card";
-    card.setAttribute("data-id", photo.id);
+    card.tabIndex = 0;
     card.setAttribute("role", "button");
-    card.setAttribute("tabindex", "0");
-    card.setAttribute("aria-label", `View photo ${photo.id}`);
+    card.setAttribute("aria-label", `View photo ${p.id}`);
 
-    // Skeleton shimmer
     const shimmer = document.createElement("div");
     shimmer.className = "shimmer";
-    card.appendChild(shimmer);
 
-    // Image
     const img = document.createElement("img");
     img.loading = "lazy";
     img.decoding = "async";
-    img.alt = `Gallery photo ${photo.id}`;
-    img.src = photo.src;
-
-    // Desktop hover download button
-    const dlBtn = document.createElement("a");
-    dlBtn.className = "card-dl-btn";
-    dlBtn.href = photo.src;
-    dlBtn.download = photo.filename;
-    dlBtn.title = "Download";
-    dlBtn.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 10l5 5 5-5M5 20h14"/></svg>`;
-    dlBtn.addEventListener("click", (e) => e.stopPropagation());
-
-    card.appendChild(img);
-    card.appendChild(dlBtn);
-
-    img.addEventListener("load", () => {
-      card.classList.add("loaded");
-      photo.status = "loaded";
-    });
-
+    img.alt = `Gallery photo ${p.id}`;
+    img.src = thumbUrl(p);
+    img.addEventListener("load", () => card.classList.add("loaded"));
+    let stage = 0;
     img.addEventListener("error", () => {
-      photo.status = "failed";
-      card.style.display = "none";
+      stage++;
+      if (stage === 1 && thumbUrl(p) !== p.src) img.src = p.src;        // preview failed -> try the original
+      else if (!p.swapped) { swapCase(p); dl.href = p.src; dl.download = p.filename; img.src = thumbUrl(p); stage = 0; } // maybe wrong casing -> retry once
+      else card.style.display = "none";                                  // nothing worked -> hide
     });
 
-    card.addEventListener("click", () => openLightbox(index));
-    card.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        openLightbox(index);
-      }
-    });
+    const dl = document.createElement("a");
+    dl.className = "card-dl-btn";
+    dl.href = p.src;               // always the ORIGINAL file
+    dl.download = p.filename;
+    dl.title = "Download original";
+    dl.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 10l5 5 5-5M5 20h14"/></svg>`;
+    dl.addEventListener("click", e => { e.stopPropagation(); saveOriginal(e, p); });
 
+    card.append(shimmer, img, dl);
+
+    const act = () => openLightbox(index);
+    card.addEventListener("click", act);
+    card.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); act(e); } });
     return card;
   }
 
-  // Render batch
-  function renderBatch(count = BATCH_SIZE) {
-    const nextLimit = Math.min(renderedCount + count, photoList.length);
-    const fragment = document.createDocumentFragment();
-
-    for (let i = renderedCount; i < nextLimit; i++) {
-      fragment.appendChild(createCard(photoList[i], i));
-    }
-
-    galleryEl.appendChild(fragment);
-    renderedCount = nextLimit;
-
-    countLabel.textContent = `${photoList.length} photographs`;
+  function renderBatch() {
+    const end = Math.min(rendered + BATCH, view.length);
+    for (let i = rendered; i < end; i++) { const c = createCard(view[i], i); cards.push(c); placeCard(c); }
+    rendered = end;
+    io.unobserve(sentinel); io.observe(sentinel); // re-check if sentinel is still visible
   }
+  const io = new IntersectionObserver(es => {
+    if (es[0].isIntersecting && rendered < view.length) renderBatch();
+  }, { rootMargin: "900px" });
 
-  // Initial render
-  renderBatch(BATCH_SIZE);
+  /* =====================================================
+     5) LIGHTBOX  (shows ORIGINAL quality)
+     ===================================================== */
+  const lightbox = $("lightbox"), lbImg = $("lbImg"), lbStage = $("lbStage"), lbCounter = $("lbCounter"),
+        lbDownload = $("lbDownload");
+  let cur = 0;
 
-  // Progressive infinite scroll
-  window.addEventListener("scroll", () => {
-    if (renderedCount < photoList.length) {
-      const scrollPos = window.innerHeight + window.scrollY;
-      const threshold = document.documentElement.scrollHeight - 600;
-      if (scrollPos >= threshold) {
-        renderBatch(BATCH_SIZE);
-      }
-    }
-  }, { passive: true });
-
-  // Lightbox Implementation
-  function openLightbox(index) {
-    currentIdx = index;
-    updateLightbox();
-    lightbox.classList.add("open");
-    lightbox.setAttribute("aria-hidden", "false");
-    document.body.style.overflow = "hidden";
-  }
-
-  function closeLightbox() {
-    lightbox.classList.remove("open");
-    lightbox.setAttribute("aria-hidden", "true");
-    document.body.style.overflow = "";
-  }
-
+  function openLightbox(i) { cur = i; updateLightbox(); lightbox.classList.add("open"); lightbox.setAttribute("aria-hidden", "false"); document.body.style.overflow = "hidden"; }
+  function closeLightbox() { lightbox.classList.remove("open"); lightbox.setAttribute("aria-hidden", "true"); document.body.style.overflow = ""; }
   function updateLightbox() {
-    const photo = photoList[currentIdx];
-    if (!photo) return;
-    lbImg.src = photo.src;
-    lbCounter.textContent = `${String(currentIdx + 1).padStart(3, "0")} / ${String(photoList.length).padStart(3, "0")}`;
-    lbDownload.href = photo.src;
-    lbDownload.download = photo.filename;
+    const p = view[cur]; if (!p) return;
+    lbImg.classList.add("loading");
+    lbImg.src = thumbUrl(p);                  // instant (already cached) preview...
+    const full = new Image();
+    full.onload = () => { if (view[cur] === p) { lbImg.src = p.src; lbImg.classList.remove("loading"); } }; // ...swapped for original
+    full.src = p.src;
+    lbCounter.textContent = `${String(cur + 1).padStart(3, "0")} / ${String(view.length).padStart(3, "0")}`;
+    lbDownload.href = p.src;
+    lbDownload.download = p.filename;
   }
+  function step(d) { cur = (cur + d + view.length) % view.length; updateLightbox(); }
 
-  function stepLightbox(delta) {
-    currentIdx = (currentIdx + delta + photoList.length) % photoList.length;
-    updateLightbox();
-  }
-
-  lbClose.addEventListener("click", closeLightbox);
-  lbPrev.addEventListener("click", () => stepLightbox(-1));
-  lbNext.addEventListener("click", () => stepLightbox(1));
-  lbMobilePrev.addEventListener("click", () => stepLightbox(-1));
-  lbMobileNext.addEventListener("click", () => stepLightbox(1));
-
-  // Close when clicking outside the image
-  lightbox.addEventListener("click", (e) => {
-    if (e.target === lightbox || e.target === lbStage) {
-      closeLightbox();
-    }
+  $("lbClose").onclick = closeLightbox;
+  lbDownload.addEventListener("click", e => saveOriginal(e, view[cur]));
+  $("lbPrev").onclick = $("lbMobilePrev").onclick = () => step(-1);
+  $("lbNext").onclick = $("lbMobileNext").onclick = () => step(1);
+  lightbox.addEventListener("click", e => { if (e.target === lightbox || e.target === lbStage) closeLightbox(); });
+  lbStage.addEventListener("click", e => {
+    if (e.target !== lbImg) return;
+    const r = lbImg.getBoundingClientRect(), x = e.clientX - r.left;
+    if (x < r.width * 0.3) step(-1); else if (x > r.width * 0.7) step(1);
   });
-
-  // Tap left/right 30% of screen to navigate on touch/click
-  lbStage.addEventListener("click", (e) => {
-    if (e.target === lbImg) {
-      const rect = lbImg.getBoundingClientRect();
-      const clickX = e.clientX - rect.left;
-      if (clickX < rect.width * 0.3) {
-        stepLightbox(-1);
-      } else if (clickX > rect.width * 0.7) {
-        stepLightbox(1);
-      }
-    }
-  });
-
-  document.addEventListener("keydown", (e) => {
+  document.addEventListener("keydown", e => {
     if (!lightbox.classList.contains("open")) return;
     if (e.key === "Escape") closeLightbox();
-    if (e.key === "ArrowLeft") stepLightbox(-1);
-    if (e.key === "ArrowRight") stepLightbox(1);
+    if (e.key === "ArrowLeft") step(-1);
+    if (e.key === "ArrowRight") step(1);
   });
-
-  // Mobile Touch Swipe for Lightbox
-  let touchStartX = null;
-  lightbox.addEventListener("touchstart", (e) => {
-    touchStartX = e.touches[0].clientX;
+  let tx = null;
+  lightbox.addEventListener("touchstart", e => { tx = e.touches[0].clientX; }, { passive: true });
+  lightbox.addEventListener("touchend", e => {
+    if (tx === null) return;
+    const d = e.changedTouches[0].clientX - tx;
+    if (Math.abs(d) > 45) step(d > 0 ? -1 : 1);
+    tx = null;
   }, { passive: true });
 
-  lightbox.addEventListener("touchend", (e) => {
-    if (touchStartX === null) return;
-    const diff = e.changedTouches[0].clientX - touchStartX;
-    if (Math.abs(diff) > 45) {
-      stepLightbox(diff > 0 ? -1 : 1);
-    }
-    touchStartX = null;
-  }, { passive: true });
+  /* =====================================================
+     7) THEME
+     ===================================================== */
+  $("desktopThemeBtn").addEventListener("click", () => {
+    const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("gallery-theme", next); } catch (e) {}
+  });
+  try { const s = localStorage.getItem("gallery-theme"); if (s) document.documentElement.setAttribute("data-theme", s); } catch (e) {}
 
-  // Theme Toggle Functionality
-  function toggleTheme() {
-    const isDark = document.documentElement.getAttribute("data-theme") === "dark";
-    const nextTheme = isDark ? "light" : "dark";
-    document.documentElement.setAttribute("data-theme", nextTheme);
-    try {
-      localStorage.setItem("gallery-theme", nextTheme);
-    } catch(e){}
-  }
-
-  desktopThemeBtn.addEventListener("click", toggleTheme);
-
-  // Restore saved theme
-  try {
-    const saved = localStorage.getItem("gallery-theme");
-    if (saved) {
-      document.documentElement.setAttribute("data-theme", saved);
-    }
-  } catch(e){}
-
+  render();
 })();
 </script>
 </body>
